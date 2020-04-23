@@ -9,7 +9,8 @@ from typing import Any, Dict, List, Tuple
 import time
 from PIL import Image
 import magic
-import notify2
+
+# import notify2 # JOHN: Removed to avoid dealing with dbus
 
 import argparse
 import cmd2.plugin
@@ -17,7 +18,8 @@ import textwrap
 from cmd2 import clipboard
 from cmd2.argparse_custom import Cmd2ArgumentParser, CompletionItem
 from colorama import Fore, Style
-from dbus import DBusException
+
+# from dbus import DBusException
 from pyperclip import PyperclipException
 from watchdog.events import FileSystemEventHandler, FileSystemEvent, FileCreatedEvent
 from watchdog.observers import Observer
@@ -106,18 +108,19 @@ class ReplMonitor(JsonMonitor):
         # Reverse the chain
         chain = chain[::-1]
 
-        # Send a desktop notification
-        try:
-            notify2.init("new flag")
-            notification = notify2.Notification(
-                f"{flag}",
-                f"{' -> '.join([str(x) for x in chain])}: solved",
-                os.path.join(os.path.dirname(katana.util.__file__), "katana.png"),
-            )
-            notification.show()
-        except DBusException:
-            # dbus wasn't available (probably no X11 session)
-            pass
+        # JOHN: This was hot-fix removed because of dbus issues.
+        # # Send a desktop notification
+        # try:
+        #     notify2.init("new flag")
+        #     notification = notify2.Notification(
+        #         f"{flag}",
+        #         f"{' -> '.join([str(x) for x in chain])}: solved",
+        #         os.path.join(os.path.dirname(katana.util.__file__), "katana.png"),
+        #     )
+        #     notification.show()
+        # except DBusException:
+        #     # dbus wasn't available (probably no X11 session)
+        #     pass
 
         # Calculate ellapsed time
         ellapsed = chain[0].target.end_time - chain[0].target.start_time
@@ -1372,11 +1375,44 @@ class Repl(cmd2.Cmd):
         action="store_true",
         help="Queue challenge even if it is already solved.",
     )
+    ctf_queue_parser.add_argument("--flag", help="Custom flag format for this target")
+    ctf_queue_parser.add_argument(
+        "--unit",
+        "-u",
+        action="append",
+        default=[],
+        help="Specify a unit to run initially",
+    )
+    ctf_queue_parser.add_argument(
+        "--only", "-o", help="Run only this unit. Disable recursion."
+    )
+    ctf_queue_parser.add_argument(
+        "--exclude", "-e", action="append", default=[], help="Specify blacklisted units"
+    )
+    ctf_queue_parser.add_argument(
+        "--auto",
+        "-a",
+        action="store_true",
+        help="Automatically select units for recursive targets",
+        default=None,
+    )
+    ctf_queue_parser.add_argument(
+        "--no-auto",
+        "-na",
+        action="store_false",
+        dest="auto",
+        help="Disable automatic unit selection for recursive targets",
+    )
     ctf_queue_parser.add_argument(
         "challenge_id",
         type=str,
         help="Challenge ID to queue",
         choices_method=get_challenge_choices,
+    )
+    ctf_queue_parser.add_argument(
+        "option",
+        help="Set a configuration option (format: 'section[option]=value')",
+        nargs="*",
     )
     ctf_queue_parser.set_defaults(action="queue")
 
@@ -1402,6 +1438,63 @@ class Repl(cmd2.Cmd):
             )
             return
 
+        # Build custom configuration
+        config: configparser.ConfigParser = configparser.ConfigParser()
+        config.read_dict(self.manager)
+
+        # Custom flag format
+        if args.flag is not None:
+            config["manager"]["flag-format"] = args.flag
+
+        # Custom unit list
+        if len(args.unit) > 0:
+            config["manager"]["units"] = ",".join(args.unit)
+
+        # Custom exclusion list
+        if len(args.exclude) > 0:
+            config["manager"]["exclude"] = ",".join(args.exclude)
+
+        # Auto flag specification
+        if args.auto is not None:
+            config["manager"]["auto"] = "yes" if args.auto else "no"
+
+        # Singular unit specification/one-off run
+        if args.only is not None:
+            config["manager"]["units"] = args.only
+            config["manager"]["recurse"] = "no"
+            config["manager"]["auto"] = "no"
+
+        # Other custom parameters
+        for option in args.option:
+            # Match the option specifier format
+            match = re.match(r"^([a-zA-Z_\-0-9]+)(\[[a-zA-Z_\-0-9]+\])?=(.*)?$", option)
+
+            # Ensure it's correct
+            if match is None:
+                self.perror(
+                    f"[{Fore.RED}-{Fore.RESET}] {option}: invalid option specifier"
+                )
+                return
+
+            if match.group(2) is None:
+                section = "DEFAULT"
+                option = match.group(1)
+            else:
+                section = match.group(1)
+                option = match.group(2).split("[")[1].split("]")[0]
+
+            # Ensure the section exists
+            if section not in config:
+                config[section] = {}
+
+            # Unset the value, if no value is specified
+            if match.group(3) is None:
+                config.remove_option(section, option)
+            else:
+                config[section][option] = match.group(3)
+
+        targets = []
+
         # Queue attached files
         for file, url in challenge.files.items():
             self.poutput(f"[{Fore.GREEN}+{Style.RESET_ALL}] ctf: queuing {file}")
@@ -1409,6 +1502,7 @@ class Repl(cmd2.Cmd):
             self.ctf_targets[file][1] = self.manager.queue_target(
                 bytes(url, "utf-8"), background=True
             )
+            targets.append(self.ctf_targets[file][1])
 
         # Queue description
         if args.description:
@@ -1418,8 +1512,42 @@ class Repl(cmd2.Cmd):
             key = hashlib.md5(challenge.description.encode("utf-8")).hexdigest()
             self.ctf_targets[key] = [challenge, None]
             self.ctf_targets[key][1] = self.manager.queue_target(
-                bytes(challenge.description, "utf-8"), background=True
+                bytes(challenge.description, "utf-8"), config=config, background=True
             )
+            targets.append(self.ctf_targets[key][1])
+
+        if len(targets) == 0:
+            self.poutput(f"[{Fore.YELLOW}!{Fore.RESET}] no targets found")
+            return
+
+        # Wait for target to complete
+        if args.only:
+            self.poutput(
+                f"[{Fore.GREEN}+{Fore.RESET}] waiting for target(s) completion..."
+            )
+            try:
+                while not all([t.completed for t in targets]):
+                    time.sleep(0.2)
+            except KeyboardInterrupt:
+                self.poutput(f"[{Fore.YELLOW}!{Fore.RESET}] cancelling target(s)...")
+                for t in targets:
+                    t.completed = True
+            else:
+                # The targets finished! Print the results
+                all_results = {}
+                for t in targets:
+                    results = self.manager.monitor.build_results(target=t)
+                    all_results[str(t)] = results
+
+                pretty_json = json.dumps(
+                    all_results, sort_keys=True, indent=4, separators=(",", ": ")
+                )
+
+                self.ppaged(
+                    highlight(
+                        pretty_json, lexers.JsonLexer(), formatters.TerminalFormatter()
+                    )
+                )
 
         return
 
